@@ -143,6 +143,7 @@ class MutableVamanaIndex {
     entry_point_type entry_point_;
     std::vector<SlotMetadata> status_;
     IDTranslator translator_;
+    size_t head_{0};
 
     // Thread local data structures.
     distance_type distance_;
@@ -596,7 +597,7 @@ class MutableVamanaIndex {
         slots.reserve(num_points);
 
         bool have_room = false;
-        for (size_t i = 0, imax = status_.size(); i < imax; ++i) {
+        for (size_t i = head_, imax = status_.size(); i < imax; ++i) {
             if (status_[i] == SlotMetadata::Empty) {
                 slots.push_back(i);
             }
@@ -656,6 +657,7 @@ class MutableVamanaIndex {
         for (const auto& i : slots) {
             status_[i] = SlotMetadata::Valid;
         }
+        head_ = slots.back();
         return slots;
     }
 
