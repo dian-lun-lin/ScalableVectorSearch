@@ -219,6 +219,9 @@ class VamanaBuilder {
         size_t num_batches = std::max(
             size_t{40}, lib::div_round_up(num_nodes, lib::narrow_cast<size_t>(64 * 64))
         );
+        if(num_batches > num_nodes) {
+            num_batches = 1;
+        }
         size_t batchsize = lib::div_round_up(num_nodes, num_batches);
         std::vector entry_points{entry_point};
 
