@@ -594,8 +594,7 @@ class ConcurrentVamanaBuilder {
 
     template <typename T> using set_type = tsl::robin_set<T>;
 
-    using update_type =
-        std::pair<Idx, std::vector<Idx>>;
+    using update_type = std::pair<Idx, std::vector<Idx>>;
 
     /// Constructor
     ConcurrentVamanaBuilder(
@@ -625,13 +624,8 @@ class ConcurrentVamanaBuilder {
     }
 
     template <typename R>
-    void construct(
-        float alpha,
-        Idx entry_point,
-        const size_t node_id,
-    ) {
+    void construct(float alpha, Idx entry_point, const size_t node_id, ) {
         generate_neighbors(node_id, params_.alpha, entry_point);
-
         add_reverse_edges(node_id, alpha);
     }
 
@@ -687,9 +681,8 @@ class ConcurrentVamanaBuilder {
             );
         }
 
-        const auto& post_search_query = build_adaptor.modify_post_search_query(
-            data_, node_id, graph_search_query
-        );
+        const auto& post_search_query =
+            build_adaptor.modify_post_search_query(data_, node_id, graph_search_query);
 
         // If the query and distance functors are sufficiently different for the
         // graph search and the general case, then we *may* need to reapply fix
@@ -734,18 +727,14 @@ class ConcurrentVamanaBuilder {
                 pool.emplace_back(
                     id,
                     distance::compute(
-                        general_distance,
-                        post_search_query,
-                        general_accessor(data_, id)
+                        general_distance, post_search_query, general_accessor(data_, id)
                     )
                 );
             }
         }
 
         std::sort(
-            pool.begin(),
-            pool.end(),
-            TotalOrder(distance::comparator(general_distance))
+            pool.begin(), pool.end(), TotalOrder(distance::comparator(general_distance))
         );
         pool.resize(std::min(pool.size(), params_.max_candidate_pool_size));
 
@@ -845,5 +834,5 @@ class ConcurrentVamanaBuilder {
     /// Worker threadpool.
     Pool& threadpool_;
 };
-  
+
 } // namespace svs::index::vamana

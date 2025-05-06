@@ -146,12 +146,11 @@ class ConcurrentMutableVamanaIndex {
     std::mutex global_mutex_;
     std::vector<std::mutex> per_node_mutexes_;
     size_t first_empty_ = 0;
-    std::vector<size_t> external_to_internal_id;
-    std::vector<size_t> internal_to_external_id;
+    IDTranslator translator_;
 
     // Thread local data structures.
     distance_type distance_;
-    threads::ThreadPoolHandle threadpool_;
+    threads::ThreadPoolHandle threadpool_{threads::SequentialThreadPool{}};
     lib::ReadWriteProtected<VamanaSearchParameters> search_parameters_;
 
     // Configurations
@@ -170,14 +169,13 @@ class ConcurrentMutableVamanaIndex {
     // Methods
   public:
     // Constructors
-    template <typename ExternalIds, typename ThreadPoolProto>
+    template <typename ExternalIds>
     ConcurrentMutableVamanaIndex(
         Graph graph,
         Data data,
         Idx entry_point,
         Dist distance_function,
         const ExternalIds& external_ids,
-        ThreadPoolProto threadpool_proto,
         // Optional logger parameter
         svs::logging::logger_ptr logger = svs::logging::get()
     )
@@ -189,7 +187,6 @@ class ConcurrentMutableVamanaIndex {
         , first_empty_{data_.size()}
         , translator_()
         , distance_{std::move(distance_function)}
-        , threadpool_{threads::as_threadpool(std::move(threadpool_proto))}
         , search_parameters_{vamana::construct_default_search_parameters(data_)}
         , construction_window_size_{2 * graph.max_degree()}
         // Ctor accept logger in parameter
@@ -200,13 +197,12 @@ class ConcurrentMutableVamanaIndex {
     ///
     /// Build a graph from scratch.
     ///
-    template <typename ExternalIds, typename ThreadPoolProto>
+    template <typename ExternalIds>
     ConcurrentMutableVamanaIndex(
         const VamanaBuildParameters& parameters,
         Data data,
         const ExternalIds& external_ids,
         Dist distance_function,
-        ThreadPoolProto threadpool_proto,
         svs::logging::logger_ptr logger = svs::logging::get()
     )
         : graph_(Graph{data.size(), parameters.graph_max_degree})
@@ -217,7 +213,6 @@ class ConcurrentMutableVamanaIndex {
         , first_empty_{data_.size()}
         , translator_()
         , distance_(std::move(distance_function))
-        , threadpool_(threads::as_threadpool(std::move(threadpool_proto)))
         , search_parameters_(vamana::construct_default_search_parameters(data_))
         , build_parameters_(parameters)
         , logger_{std::move(logger)} {
@@ -260,14 +255,12 @@ class ConcurrentMutableVamanaIndex {
     /// * The data and graph were saved with no "holes". In otherwords, the index was
     ///   consolidated and compacted prior to saving.
     /// * The span of internal ID's in translator covers exactly ``[0, data.size())``.
-    template <threads::ThreadPool Pool>
     ConcurrentMutableVamanaIndex(
         const VamanaIndexParameters& config,
         data_type data,
         graph_type graph,
         const Dist& distance_function,
         IDTranslator translator,
-        Pool threadpool,
         svs::logging::logger_ptr logger = svs::logging::get()
     )
         : graph_{std::move(graph)}
@@ -278,7 +271,6 @@ class ConcurrentMutableVamanaIndex {
         , first_empty_{data_.size()}
         , translator_{std::move(translator)}
         , distance_{distance_function}
-        , threadpool_{std::move(threadpool)}
         , search_parameters_{config.search_parameters}
         , construction_window_size_{config.build_parameters.window_size}
         , max_candidates_{config.build_parameters.max_candidate_pool_size}
@@ -347,18 +339,12 @@ class ConcurrentMutableVamanaIndex {
     ///
     /// @see has_id, translate_internal_id
     ///
-    Idx translate_external_id(size_t e) const { 
-        std::shared_lock lock{translator_mutex_};
-        return translator_.get_internal(e); 
-    }
+    Idx translate_external_id(size_t e) const { return translator_.get_internal(e); }
 
     ///
     /// @brief Check whether the external ID `e` exists in the index.
     ///
-    bool has_id(size_t e) const { 
-        std::shared_lock lock{translator_mutex_};
-        return translator_.has_external(e); 
-    }
+    bool has_id(size_t e) const { return translator_.has_external(e); }
 
     ///
     /// @brief Get the external ID mapped to be `i`.
@@ -367,10 +353,7 @@ class ConcurrentMutableVamanaIndex {
     ///
     /// Requires that mapping for `i` exists. Otherwise, all bets are off.
     ///
-    size_t translate_internal_id(Idx i) const { 
-        std::shared_lock lock{translator_mutex_};
-        return translator_.get_external(i); 
-    }
+    size_t translate_internal_id(Idx i) const { return translator_.get_external(i); }
 
     ///
     /// @brief Call the functor with all external IDs in the index.
@@ -379,8 +362,7 @@ class ConcurrentMutableVamanaIndex {
     ///     each external ID in the index.
     ///
     template <typename F> void on_ids(F&& f) const {
-        std::shared_lock lock{translator_mutex_};
-        for (auto pair : translator_) {
+        for (const auto pair : translator_) {
             f(pair.first);
         }
     }
@@ -395,12 +377,7 @@ class ConcurrentMutableVamanaIndex {
     }
 
     /// @brief Return the number of **valid** (non-deleted) entries in the index.
-    size_t size() const {
-        // NB: Index translation should always be kept in-sync with the number of valid
-        // elements.
-        std::shared_lock lock{translator_mutex_};
-        return translator_.size();
-    }
+    size_t size() const { return translator_.size(); }
 
     ///
     /// @brief Translate in-place a collection of internal IDs to external IDs.
@@ -422,13 +399,14 @@ class ConcurrentMutableVamanaIndex {
     ///     behavior is undefined.
     ///
     template <class Dims, class Base>
-        requires(std::tuple_size_v<Dims> == 2)
-    void translate_to_external(DenseArray<size_t, Dims, Base>& ids) {
+    requires(std::tuple_size_v<Dims> == 2) void translate_to_external(
+        DenseArray<size_t, Dims, Base>& ids
+    ) const {
         // N.B.: lib::narrow_cast should be valid because the origin of the IDs is internal.
-        for (auto i : is) {
+        for (auto i : ids) {
             for (size_t j = 0, jmax = getsize<1>(ids); j < jmax; ++j) {
                 auto internal = lib::narrow_cast<Idx>(ids.at(i, j));
-                ids.at(i, j) = translate_internal_id(internal);
+                ids.at(i, j) = translate_external_id(internal);
             }
         }
     }
@@ -484,6 +462,7 @@ class ConcurrentMutableVamanaIndex {
         scratchspace_type& scratch,
         const lib::DefaultPredicate& cancel = lib::Returns(lib::Const<false>())
     ) const {
+        std::shared_lock lock{glboal_mutex};
         extensions::single_search(
             data_,
             scratch.buffer,
@@ -501,12 +480,14 @@ class ConcurrentMutableVamanaIndex {
         const search_parameters_type& sp,
         const lib::DefaultPredicate& cancel = lib::Returns(lib::Const<false>())
     ) {
+        std::shared_lock lock{glboal_mutex};
+
         size_t num_neighbors = results.n_neighbors();
         auto buffer =
             search_buffer_type{sp.buffer_config_, distance::comparator(distance_)};
 
-        auto prefetch_parameters = GreedySearchPrefetchParameters{
-            sp.prefetch_lookahead_, sp.prefetch_step_};
+        auto prefetch_parameters =
+            GreedySearchPrefetchParameters{sp.prefetch_lookahead_, sp.prefetch_step_};
 
         // Legalize search buffer for this search.
         if (buffer.target() < num_neighbors) {
@@ -522,7 +503,7 @@ class ConcurrentMutableVamanaIndex {
             greedy_search_closure(prefetch_parameters, cancel)
         );
 
-        for(size_t j = 0; j < num_neighbors; ++j) {
+        for (size_t j = 0; j < num_neighbors; ++j) {
             result.set(buffer[j], 0, j);
         }
 
@@ -539,28 +520,28 @@ class ConcurrentMutableVamanaIndex {
     ///
     /// @brief Return a unique instance of the distance function.
     ///
-    //Dist distance_function() const { return threads::shallow_copy(distance_); }
+    Dist distance_function() const { return threads::shallow_copy(distance_); }
 
     ///
     /// Perform an exhaustive search on the current state of the index.
     /// Useful to understand how well the graph search is doing after index mutation.
     ///
-    //template <typename QueryType, typename I>
-    //void exhaustive_search(
-        //const data::ConstSimpleDataView<QueryType>& queries,
-        //size_t num_neighbors,
-        //QueryResultView<I> result
+    // template <typename QueryType, typename I>
+    // void exhaustive_search(
+    // const data::ConstSimpleDataView<QueryType>& queries,
+    // size_t num_neighbors,
+    // QueryResultView<I> result
     //) {
-        //auto temp_index = temporary_flat_index(
-            //data_, distance_, threads::ThreadPoolReferenceWrapper(threadpool_)
-        //);
-        //temp_index.search(queries, num_neighbors, result, [&](size_t i) {
-            //return getindex(status_, i) == SlotMetadata::Valid;
-        //});
+    // auto temp_index = temporary_flat_index(
+    // data_, distance_, threads::ThreadPoolReferenceWrapper(threadpool_)
+    //);
+    // temp_index.search(queries, num_neighbors, result, [&](size_t i) {
+    // return getindex(status_, i) == SlotMetadata::Valid;
+    //});
 
-        //// After the search procedure, the indices in `results` are internal.
-        //// Perform one more pass to convert these to external ids.
-        //translate_to_external(result.indices());
+    //// After the search procedure, the indices in `results` are internal.
+    //// Perform one more pass to convert these to external ids.
+    // translate_to_external(result.indices());
     //}
 
     ///
@@ -569,7 +550,6 @@ class ConcurrentMutableVamanaIndex {
     constexpr std::string_view name() const { return "concurrent dynamic vamana index"; }
 
     ///// Mutable Interface
-
 
     ///
     /// @brief Add the points with the given external IDs to the dataset.
@@ -588,22 +568,18 @@ class ConcurrentMutableVamanaIndex {
     /// find and fill these empty entries when adding new points.
     ///
     template <data::ImmutableMemoryDataset Points, class ExternalIds>
-    size_t add_points(
-        const Points& points, const ExternalIds& external_ids
-    ) {
+    size_t add_points(const Points& points, const ExternalIds& external_ids) {
         const size_t num_points = points.size();
         const size_t num_ids = external_ids.size();
         if (num_points != num_ids && num_points != 1) {
             throw ANNEXCEPTION(
-                "Number of points ({}) not equal to the number of external ids ({})!",
-                num_points,
-                num_ids
+                "Number of points ({}) and the number of external ids ({}) should be one!",
             );
         }
 
         size_t s = first_empty_.fetch_add();
-        if(s > status_.size()) {
-            std::scoped_lock lk{glboal_mutex_, translator_mutex_};
+        if (s > status_.size()) {
+            std::unique_lock lock{glboal_mutex_};
 
             // TODO: how do we enlarge the size?
             size_t new_size = data_.size() + 10000;
@@ -614,12 +590,13 @@ class ConcurrentMutableVamanaIndex {
             // Try to update the id translation now that we have internal ids.
             translator_.insert(external_ids, slots);
 
-            // Copy the given points into the data and clear the adjacency lists for the graph.
+            // Copy the given points into the data and clear the adjacency lists for the
+            // graph.
             data_.set_datum(slot, point);
-            graph_.clear_node(id);
+            graph_.clear_node(slot);
         }
-        std::shared_lock glk{global_mutex_};
-        std::unique_lock lock{per_node_mutexes_[slot]};
+        std::shared_lock lock{global_mutex_};
+        std::unique_lock per_node_lock{per_node_mutexes_[slot]};
 
         // Patch in the new neighbors.
         auto parameters = VamanaBuildParameters{
@@ -633,8 +610,14 @@ class ConcurrentMutableVamanaIndex {
         auto sp = get_search_parameters();
         auto prefetch_parameters =
             GreedySearchPrefetchParameters{sp.prefetch_lookahead_, sp.prefetch_step_};
-        SingleVamanaBuilder builder{
-            graph_, data_, per_node_mutexes, distance_, parameters, threadpool_, prefetch_parameters};
+        ConcurrentVamanaBuilder builder{
+            graph_,
+            data_,
+            per_node_mutexes,
+            distance_,
+            parameters,
+            threadpool_,
+            prefetch_parameters};
         builder.construct(alpha_, entry_point(), slot, logging::Level::Trace);
 
         status_[slot] = SlotMetadata::Valid;
@@ -664,23 +647,24 @@ class ConcurrentMutableVamanaIndex {
     ///   Delete consolidation performs the actual removal of deleted entries from the
     ///   graph.
     ///
-    //template <typename T> void delete_entries(const T& ids) {
-        //translator_.check_external_exist(ids.begin(), ids.end());
-        //for (auto i : ids) {
-            //delete_entry(translator_.get_internal(i));
-        //}
-        //translator_.delete_external(ids);
+    // template <typename T> void delete_entries(const T& ids) {
+    // translator_.check_external_exist(ids.begin(), ids.end());
+    // for (auto i : ids) {
+    // delete_entry(translator_.get_internal(i));
+    //}
+    // translator_.delete_external(ids);
     //}
 
-    //void delete_entry(size_t i) {
-        //SlotMetadata& meta = getindex(status_, i);
-        //assert(meta == SlotMetadata::Valid);
-        //meta = SlotMetadata::Deleted;
+    // void delete_entry(size_t i) {
+    // SlotMetadata& meta = getindex(status_, i);
+    // assert(meta == SlotMetadata::Valid);
+    // meta = SlotMetadata::Deleted;
     //}
 
-    //bool is_deleted(size_t i) const { return status_[i] != SlotMetadata::Valid; }
+    // bool is_deleted(size_t i) const { return status_[i] != SlotMetadata::Valid; }
 
     Idx entry_point() const {
+        std::shared_lock lock{glboal_mutex};
         assert(entry_point_.size() == 1);
         return entry_point_[0];
     }
@@ -690,15 +674,15 @@ class ConcurrentMutableVamanaIndex {
     ///
     /// This includes both valid and soft-deleted entries.
     ///
-    //std::vector<Idx> nonmissing_indices() const {
-        //auto indices = std::vector<Idx>();
-        //indices.reserve(size());
-        //for (size_t i = 0, imax = status_.size(); i < imax; ++i) {
-            //if (!is_deleted(i)) {
-                //indices.push_back(i);
-            //}
-        //}
-        //return indices;
+    // std::vector<Idx> nonmissing_indices() const {
+    // auto indices = std::vector<Idx>();
+    // indices.reserve(size());
+    // for (size_t i = 0, imax = status_.size(); i < imax; ++i) {
+    // if (!is_deleted(i)) {
+    // indices.push_back(i);
+    //}
+    //}
+    // return indices;
     //}
 
     ///
@@ -707,105 +691,105 @@ class ConcurrentMutableVamanaIndex {
     /// @param batch_size Granularity at which points are shuffled. Setting this higher can
     ///     improve performance but requires more working memory.
     ///
-    //void compact(Idx batch_size = 1'000) {
-        //// Step 1: Compute a prefix-sum matching each valid internal index to its new
-        //// internal index.
-        ////
-        //// In the returned data structure, an entry `j` at index `i` means that the
-        //// data at index `j` is to be moved to index `i`.
-        //auto new_to_old_id_map = nonmissing_indices();
+    // void compact(Idx batch_size = 1'000) {
+    //// Step 1: Compute a prefix-sum matching each valid internal index to its new
+    //// internal index.
+    ////
+    //// In the returned data structure, an entry `j` at index `i` means that the
+    //// data at index `j` is to be moved to index `i`.
+    // auto new_to_old_id_map = nonmissing_indices();
 
-        //// Construct an associative data structure to facilitate graph adjacency list
-        //// remapping.
-        //auto old_to_new_id_map = tsl::robin_map<Idx, Idx>{};
-        //for (Idx new_id = 0, imax = new_to_old_id_map.size(); new_id < imax; ++new_id) {
-            //Idx old_id = new_to_old_id_map.at(new_id);
-            //old_to_new_id_map.insert({old_id, new_id});
-        //}
+    //// Construct an associative data structure to facilitate graph adjacency list
+    //// remapping.
+    // auto old_to_new_id_map = tsl::robin_map<Idx, Idx>{};
+    // for (Idx new_id = 0, imax = new_to_old_id_map.size(); new_id < imax; ++new_id) {
+    // Idx old_id = new_to_old_id_map.at(new_id);
+    // old_to_new_id_map.insert({old_id, new_id});
+    //}
 
-        //// Compact the data.
-        //data_.compact(lib::as_const_span(new_to_old_id_map), threadpool_, batch_size);
+    //// Compact the data.
+    // data_.compact(lib::as_const_span(new_to_old_id_map), threadpool_, batch_size);
 
-        //// Manually compact the graph.
-        //auto temp_graph = graphs::SimpleGraph<Idx>(batch_size, graph_.max_degree());
+    //// Manually compact the graph.
+    // auto temp_graph = graphs::SimpleGraph<Idx>(batch_size, graph_.max_degree());
 
-        //// TODO: Write helper classes to do this partitioning.
-        //Idx start = 0;
-        //Idx max_index = new_to_old_id_map.size();
-        //while (start < max_index) {
-            //Idx stop = std::min(start + batch_size, max_index);
-            //// Remapping of start index to stop index.
-            //auto batch_to_new_id_map = threads::UnitRange{start, stop};
-            //auto this_batch = batch_to_new_id_map.eachindex();
+    //// TODO: Write helper classes to do this partitioning.
+    // Idx start = 0;
+    // Idx max_index = new_to_old_id_map.size();
+    // while (start < max_index) {
+    // Idx stop = std::min(start + batch_size, max_index);
+    //// Remapping of start index to stop index.
+    // auto batch_to_new_id_map = threads::UnitRange{start, stop};
+    // auto this_batch = batch_to_new_id_map.eachindex();
 
-            //// Copy the graph into the temporary buffer and remap the IDs.
-            //threads::parallel_for(
-                //threadpool_,
-                //threads::StaticPartition(this_batch),
-                //[&](const auto& batch_ids, uint64_t [>tid<]) {
-                    //std::vector<Idx> buffer{};
-                    //for (auto batch_id : batch_ids) {
-                        //auto new_id = batch_to_new_id_map[batch_id];
-                        //auto old_id = new_to_old_id_map[new_id];
+    //// Copy the graph into the temporary buffer and remap the IDs.
+    // threads::parallel_for(
+    // threadpool_,
+    // threads::StaticPartition(this_batch),
+    //[&](const auto& batch_ids, uint64_t [>tid<]) {
+    // std::vector<Idx> buffer{};
+    // for (auto batch_id : batch_ids) {
+    // auto new_id = batch_to_new_id_map[batch_id];
+    // auto old_id = new_to_old_id_map[new_id];
 
-                        //const auto& list = graph_.get_node(old_id);
-                        //buffer.resize(list.size());
+    // const auto& list = graph_.get_node(old_id);
+    // buffer.resize(list.size());
 
-                        //// Transform the adjacency list from old to new.
-                        //std::transform(
-                            //list.begin(),
-                            //list.end(),
-                            //buffer.begin(),
-                            //[&old_to_new_id_map](Idx old_id) {
-                                //return old_to_new_id_map.at(old_id);
-                            //}
-                        //);
+    //// Transform the adjacency list from old to new.
+    // std::transform(
+    // list.begin(),
+    // list.end(),
+    // buffer.begin(),
+    //[&old_to_new_id_map](Idx old_id) {
+    // return old_to_new_id_map.at(old_id);
+    //}
+    //);
 
-                        //temp_graph.replace_node(batch_id, buffer);
-                    //}
-                //}
-            //);
+    // temp_graph.replace_node(batch_id, buffer);
+    //}
+    //}
+    //);
 
-            //// Copy the entries in the temporary graph to the original graph.
-            //threads::parallel_for(
-                //threadpool_,
-                //threads::StaticPartition(this_batch),
-                //[&](const auto& batch_ids, uint64_t [>tid<]) {
-                    //for (auto batch_id : batch_ids) {
-                        //auto new_id = batch_to_new_id_map[batch_id];
-                        //graph_.replace_node(new_id, temp_graph.get_node(batch_id));
-                    //}
-                //}
-            //);
-            //start = stop;
-        //}
+    //// Copy the entries in the temporary graph to the original graph.
+    // threads::parallel_for(
+    // threadpool_,
+    // threads::StaticPartition(this_batch),
+    //[&](const auto& batch_ids, uint64_t [>tid<]) {
+    // for (auto batch_id : batch_ids) {
+    // auto new_id = batch_to_new_id_map[batch_id];
+    // graph_.replace_node(new_id, temp_graph.get_node(batch_id));
+    //}
+    //}
+    //);
+    // start = stop;
+    //}
 
-        /////// Finishing steps.
-        //// Resize the graph and data.
-        //graph_.unsafe_resize(max_index);
-        //data_.resize(max_index);
-        //first_empty_ = max_index;
+    /////// Finishing steps.
+    //// Resize the graph and data.
+    // graph_.unsafe_resize(max_index);
+    // data_.resize(max_index);
+    // first_empty_ = max_index;
 
-        //// Compact metadata and ID remapping.
-        //for (size_t new_id = 0; new_id < max_index; ++new_id) {
-            //auto old_id = getindex(new_to_old_id_map, new_id);
-            //// No work to be done if there was no remapping.
-            //if (new_id == old_id) {
-                //continue;
-            //}
+    //// Compact metadata and ID remapping.
+    // for (size_t new_id = 0; new_id < max_index; ++new_id) {
+    // auto old_id = getindex(new_to_old_id_map, new_id);
+    //// No work to be done if there was no remapping.
+    // if (new_id == old_id) {
+    // continue;
+    //}
 
-            //auto status = getindex(status_, old_id);
-            //status_[new_id] = status;
-            //if (status == SlotMetadata::Valid) {
-                //translator_.remap_internal_id(old_id, new_id);
-            //}
-        //}
-        //status_.resize(max_index);
+    // auto status = getindex(status_, old_id);
+    // status_[new_id] = status;
+    // if (status == SlotMetadata::Valid) {
+    // translator_.remap_internal_id(old_id, new_id);
+    //}
+    //}
+    // status_.resize(max_index);
 
-        //// Update entry points.
-        //for (auto& ep : entry_point_) {
-            //ep = old_to_new_id_map.at(ep);
-        //}
+    //// Update entry points.
+    // for (auto& ep : entry_point_) {
+    // ep = old_to_new_id_map.at(ep);
+    //}
     //}
 
     ///// Threading Interface
@@ -813,10 +797,16 @@ class ConcurrentMutableVamanaIndex {
     /// @brief Return the current number of threads used for search.
     ///
     /// @sa set_num_threads
-    size_t get_num_threads() const { return threadpool_.size(); }
+    size_t get_num_threads() const { return 1; }
 
     void set_threadpool(threads::ThreadPoolHandle threadpool) {
-        threadpool_ = std::move(threadpool);
+        try {
+            threadpool.get<threads::SequentialThreadPool>();
+        } catch (const ANNEXCEPTION& e) {
+            throw ANNEXCEPTION(
+                "Concurrent dynamic vamana index only allows SequentialThreadPool!"
+            );
+        }
     }
 
     ///
@@ -826,11 +816,11 @@ class ConcurrentMutableVamanaIndex {
     ///
     /// @copydoc threadpool_requirements
     ///
-    //template <threads::ThreadPool Pool>
-    //void set_threadpool(Pool threadpool)
-        //requires(!std::is_same_v<Pool, threads::ThreadPoolHandle>)
+    // template <threads::ThreadPool Pool>
+    // void set_threadpool(Pool threadpool)
+    // requires(!std::is_same_v<Pool, threads::ThreadPoolHandle>)
     //{
-        //set_threadpool(threads::ThreadPoolHandle(std::move(threadpool)));
+    // set_threadpool(threads::ThreadPoolHandle(std::move(threadpool)));
     //}
 
     ///
@@ -866,45 +856,47 @@ class ConcurrentMutableVamanaIndex {
     }
 
     ///// Mutation
-    //void consolidate() {
-        //auto check_is_deleted = [&](size_t i) { return this->is_deleted(i); };
-        //std::function<bool(size_t)> valid = [&](size_t i) {
-            //return !(this->is_deleted(i));
-        //};
+    void consolidate(
+        const threads::ThreadPoolHandle& threadpool = threads::SequentialThreadPool{}
+    ) {
+        auto check_is_deleted = [&](size_t i) { return this->is_deleted(i); };
+        std::function<bool(size_t)> valid = [&](size_t i) {
+            return !(this->is_deleted(i));
+        };
 
-        //// Determine if the entry point is deleted.
-        //// If so - we need to pick a new one.
-        //assert(entry_point_.size() == 1);
-        //auto entry_point = entry_point_[0];
-        //if (status_.at(entry_point) == SlotMetadata::Deleted) {
-            //auto logger = svs::logging::get();
-            //svs::logging::debug(logger, "Replacing entry point.");
-            //auto new_entry_point =
-                //extensions::compute_entry_point(data_, threadpool_, valid);
-            //svs::logging::debug(logger, "New point: {}", new_entry_point);
-            //assert(!is_deleted(new_entry_point));
-            //entry_point_[0] = new_entry_point;
-        //}
+        // Determine if the entry point is deleted.
+        // If so - we need to pick a new one.
+        assert(entry_point_.size() == 1);
+        auto entry_point = entry_point_[0];
+        if (status_.at(entry_point) == SlotMetadata::Deleted) {
+            auto logger = svs::logging::get();
+            svs::logging::debug(logger, "Replacing entry point.");
+            auto new_entry_point =
+                extensions::compute_entry_point(data_, threadpool_, valid);
+            svs::logging::debug(logger, "New point: {}", new_entry_point);
+            assert(!is_deleted(new_entry_point));
+            entry_point_[0] = new_entry_point;
+        }
 
-        //// Perform graph consolidation.
-        //svs::index::vamana::consolidate(
-            //graph_,
-            //data_,
-            //threadpool_,
-            //prune_to_,
-            //max_candidates_,
-            //alpha_,
-            //distance_,
-            //check_is_deleted
-        //);
+        // Perform graph consolidation.
+        svs::index::vamana::consolidate(
+            graph_,
+            data_,
+            threadpool,
+            prune_to_,
+            max_candidates_,
+            alpha_,
+            distance_,
+            check_is_deleted
+        );
 
-        //// After consolidation - set all `Deleted` slots to `Empty`.
-        //for (auto& status : status_) {
-            //if (status == SlotMetadata::Deleted) {
-                //status = SlotMetadata::Empty;
-            //}
-        //}
-    //}
+        // After consolidation - set all `Deleted` slots to `Empty`.
+        for (auto& status : status_) {
+            if (status == SlotMetadata::Deleted) {
+                status = SlotMetadata::Empty;
+            }
+        }
+    }
 
     ///// Saving
 
@@ -963,42 +955,42 @@ class ConcurrentMutableVamanaIndex {
     //
     // Optimize search_window_size and capacity.
     // See calibrate.h for more details.
-    //template <
-        //data::ImmutableMemoryDataset Queries,
-        //data::ImmutableMemoryDataset GroundTruth>
-    //VamanaSearchParameters calibrate(
-        //const Queries& queries,
-        //const GroundTruth& groundtruth,
-        //size_t num_neighbors,
-        //double target_recall,
-        //const CalibrationParameters& calibration_parameters = {}
-    //) {
-        //// Preallocate the destination for search.
-        //// Further, reference the search lambda in the recall lambda.
-        //auto results = svs::QueryResult<size_t>{queries.size(), num_neighbors};
+    template <
+        data::ImmutableMemoryDataset Queries,
+        data::ImmutableMemoryDataset GroundTruth>
+    VamanaSearchParameters calibrate(
+        const Queries& queries,
+        const GroundTruth& groundtruth,
+        size_t num_neighbors,
+        double target_recall,
+        const CalibrationParameters& calibration_parameters = {}
+    ) {
+        // Preallocate the destination for search.
+        // Further, reference the search lambda in the recall lambda.
+        auto results = svs::QueryResult<size_t>{queries.size(), num_neighbors};
 
-        //auto do_search = [&](const search_parameters_type& p) {
-            //this->search(results.view(), queries, p);
-        //};
+        auto do_search = [&](const search_parameters_type& p) {
+            this->search(results.view(), queries, p);
+        };
 
-        //auto compute_recall = [&](const search_parameters_type& p) {
-            //// Calling `do_search` will mutate `results`.
-            //do_search(p);
-            //return svs::k_recall_at_n(results, groundtruth, num_neighbors, num_neighbors);
-        //};
+        auto compute_recall = [&](const search_parameters_type& p) {
+            // Calling `do_search` will mutate `results`.
+            do_search(p);
+            return svs::k_recall_at_n(results, groundtruth, num_neighbors, num_neighbors);
+        };
 
-        //auto p = vamana::calibrate(
-            //calibration_parameters,
-            //*this,
-            //num_neighbors,
-            //target_recall,
-            //compute_recall,
-            //do_search
-        //);
+        auto p = vamana::calibrate(
+            calibration_parameters,
+            *this,
+            num_neighbors,
+            target_recall,
+            compute_recall,
+            do_search
+        );
 
-        //set_search_parameters(p);
-        //return p;
-    //}
+        set_search_parameters(p);
+        return p;
+    }
 
     /// @brief Reconstruct vectors.
     ///
@@ -1014,45 +1006,45 @@ class ConcurrentMutableVamanaIndex {
     ///
     /// An exception will be thrown if any of these pre-conditions does not hold.
     /// If such an exception is thrown, the argument ``dst`` will be left unmodified.
-    //template <std::unsigned_integral I, svs::Arithmetic T>
-    //void reconstruct_at(data::SimpleDataView<T> dst, std::span<const I> ids) {
-        //const size_t ids_size = ids.size();
-        //const size_t dst_size = dst.size();
-        //const size_t dst_dims = dst.dimensions();
+    // template <std::unsigned_integral I, svs::Arithmetic T>
+    // void reconstruct_at(data::SimpleDataView<T> dst, std::span<const I> ids) {
+    // const size_t ids_size = ids.size();
+    // const size_t dst_size = dst.size();
+    // const size_t dst_dims = dst.dimensions();
 
-        //if (ids_size != dst_size) {
-            //throw ANNEXCEPTION(
-                //"IDs span has size {} but destination has {} vectors!", ids_size, dst_size
-            //);
-        //}
+    // if (ids_size != dst_size) {
+    // throw ANNEXCEPTION(
+    //"IDs span has size {} but destination has {} vectors!", ids_size, dst_size
+    //);
+    //}
 
-        //if (dst_dims != dimensions()) {
-            //throw ANNEXCEPTION(
-                //"Destination has dimensions {} but index is {}!", dst_dims, dimensions()
-            //);
-        //}
+    // if (dst_dims != dimensions()) {
+    // throw ANNEXCEPTION(
+    //"Destination has dimensions {} but index is {}!", dst_dims, dimensions()
+    //);
+    //}
 
-        //// Bounds checking.
-        //for (size_t i = 0; i < ids_size; ++i) {
-            //I id = ids[i]; // inbounds by loop bounds.
-            //if (!has_id(id)) {
-                //throw ANNEXCEPTION("ID {} with value {} is out of bounds!", i, id);
-            //}
-        //}
+    //// Bounds checking.
+    // for (size_t i = 0; i < ids_size; ++i) {
+    // I id = ids[i]; // inbounds by loop bounds.
+    // if (!has_id(id)) {
+    // throw ANNEXCEPTION("ID {} with value {} is out of bounds!", i, id);
+    //}
+    //}
 
-        //// Prerequisites checked - proceed with the operation.
-        //// TODO: Communicate the requested decompression type to the backend dataset to
-        //// allow more fine-grained specialization?
-        //auto threaded_function = [&](auto is, uint64_t SVS_UNUSED(tid)) {
-            //auto accessor = extensions::reconstruct_accessor(data_);
-            //for (auto i : is) {
-                //auto id = translate_external_id(ids[i]);
-                //dst.set_datum(i, accessor(data_, id));
-            //}
-        //};
-        //threads::parallel_for(
-            //threadpool_, threads::StaticPartition{ids_size}, threaded_function
-        //);
+    //// Prerequisites checked - proceed with the operation.
+    //// TODO: Communicate the requested decompression type to the backend dataset to
+    //// allow more fine-grained specialization?
+    // auto threaded_function = [&](auto is, uint64_t SVS_UNUSED(tid)) {
+    // auto accessor = extensions::reconstruct_accessor(data_);
+    // for (auto i : is) {
+    // auto id = translate_external_id(ids[i]);
+    // dst.set_datum(i, accessor(data_, id));
+    //}
+    //};
+    // threads::parallel_for(
+    // threadpool_, threads::StaticPartition{ids_size}, threaded_function
+    //);
     //}
 
     /// Invoke the provided callable with constant references to the contained graph, data,
@@ -1076,32 +1068,32 @@ class ConcurrentMutableVamanaIndex {
     ///
     /// @param allow_deleted Enable or disable deleted entries.
     ///
-    //void debug_check_invariants(bool allow_deleted) const {
-        //debug_check_size();
-        //debug_check_graph_consistency(allow_deleted);
+    // void debug_check_invariants(bool allow_deleted) const {
+    // debug_check_size();
+    // debug_check_graph_consistency(allow_deleted);
     //}
 
     ///
     /// Make sure that the capacities of the main data structures (graph, data, metadata)
     /// agree.
     ///
-    //void debug_check_size() const {
-        //size_t data_size = data_.size();
-        //auto throw_size_error = [=](const std::string& name, size_t other_size) {
-            //throw ANNEXCEPTION(
-                //"SIZE INVARIANT: Data size is {} but {} is {}.", data_size, name, other_size
-            //);
-        //};
+    // void debug_check_size() const {
+    // size_t data_size = data_.size();
+    // auto throw_size_error = [=](const std::string& name, size_t other_size) {
+    // throw ANNEXCEPTION(
+    //"SIZE INVARIANT: Data size is {} but {} is {}.", data_size, name, other_size
+    //);
+    //};
 
-        //size_t graph_size = graph_.n_nodes();
-        //if (data_size != graph_size) {
-            //throw_size_error("graph", graph_size);
-        //}
+    // size_t graph_size = graph_.n_nodes();
+    // if (data_size != graph_size) {
+    // throw_size_error("graph", graph_size);
+    //}
 
-        //size_t status_size = status_.size();
-        //if (data_size != status_size) {
-            //throw_size_error("metadata", status_size);
-        //}
+    // size_t status_size = status_.size();
+    // if (data_size != status_size) {
+    // throw_size_error("metadata", status_size);
+    //}
     //}
 
     ///
@@ -1117,57 +1109,59 @@ class ConcurrentMutableVamanaIndex {
     /// This operation should be run after ``debug_check_size()`` to ensure that
     /// the sizes of the underlying data structures are consistent.
     ///
-    //void debug_check_graph_consistency(bool allow_deleted = false) const {
-        //auto is_valid = [&, allow_deleted = allow_deleted](size_t i) {
-            //const auto& metadata = status_[i];
-            //// Use a switch to get a compiler error is we add states to `SlotMetadata`.
-            //switch (metadata) {
-                //case SlotMetadata::Valid: {
-                    //return true;
-                //}
-                //case SlotMetadata::Deleted: {
-                    //return allow_deleted;
-                //}
-                //case SlotMetadata::Empty: {
-                    //return false;
-                //}
-            //}
-            //// Make GCC happy.
-            //return false;
-        //};
+    // void debug_check_graph_consistency(bool allow_deleted = false) const {
+    // auto is_valid = [&, allow_deleted = allow_deleted](size_t i) {
+    // const auto& metadata = status_[i];
+    //// Use a switch to get a compiler error is we add states to `SlotMetadata`.
+    // switch (metadata) {
+    // case SlotMetadata::Valid: {
+    // return true;
+    //}
+    // case SlotMetadata::Deleted: {
+    // return allow_deleted;
+    //}
+    // case SlotMetadata::Empty: {
+    // return false;
+    //}
+    //}
+    //// Make GCC happy.
+    // return false;
+    //};
 
-        //for (size_t i = 0, imax = graph_.n_nodes(); i < imax; ++i) {
-            //if (!is_valid(i)) {
-                //continue;
-            //}
+    // for (size_t i = 0, imax = graph_.n_nodes(); i < imax; ++i) {
+    // if (!is_valid(i)) {
+    // continue;
+    //}
 
-            //size_t count = 0;
-            //for (auto j : graph_.get_node(i)) {
-                //if (!is_valid(j)) {
-                    //const auto& metadata = status_[j];
-                    //throw ANNEXCEPTION(
-                        //"Node number {} has an invalid ({}) neighbor ({}) at position {}!",
-                        //i,
-                        //index::vamana::name(metadata),
-                        //j,
-                        //count
-                    //);
-                //}
-                //count++;
-            //}
-        //}
+    // size_t count = 0;
+    // for (auto j : graph_.get_node(i)) {
+    // if (!is_valid(j)) {
+    // const auto& metadata = status_[j];
+    // throw ANNEXCEPTION(
+    //"Node number {} has an invalid ({}) neighbor ({}) at position {}!",
+    // i,
+    // index::vamana::name(metadata),
+    // j,
+    // count
+    //);
+    //}
+    // count++;
+    //}
+    //}
     //}
 };
 
 ///// Deduction Guides.
 // Guide for building.
 template <typename Data, typename Dist, typename ExternalIds>
-ConcurrentMutableVamanaIndex(const VamanaBuildParameters&, Data, const ExternalIds&, Dist, size_t)
-    -> ConcurrentMutableVamanaIndex<graphs::SimpleBlockedGraph<uint32_t>, Data, Dist>;
+ConcurrentMutableVamanaIndex(
+    const VamanaBuildParameters&, Data, const ExternalIds&, Dist, size_t
+) -> ConcurrentMutableVamanaIndex<graphs::SimpleBlockedGraph<uint32_t>, Data, Dist>;
 
 template <typename Data, typename Dist, typename ExternalIds, threads::ThreadPool Pool>
-ConcurrentMutableVamanaIndex(const VamanaBuildParameters&, Data, const ExternalIds&, Dist, Pool)
-    -> ConcurrentMutableVamanaIndex<graphs::SimpleBlockedGraph<uint32_t>, Data, Dist>;
+ConcurrentMutableVamanaIndex(
+    const VamanaBuildParameters&, Data, const ExternalIds&, Dist, Pool
+) -> ConcurrentMutableVamanaIndex<graphs::SimpleBlockedGraph<uint32_t>, Data, Dist>;
 
 // Guide with logging
 template <typename Data, typename Dist, typename ExternalIds, threads::ThreadPool Pool>
@@ -1220,7 +1214,7 @@ template <
     typename DataLoader,
     typename Distance,
     typename ThreadPoolProto>
-auto auto_dynamic_assemble(
+auto auto_concurrent_dynamic_assemble(
     const std::filesystem::path& config_path,
     GraphLoader&& graph_loader,
     DataLoader&& data_loader,
@@ -1298,7 +1292,6 @@ auto auto_dynamic_assemble(
         std::move(graph),
         std::move(distance),
         std::move(translator),
-        std::move(threadpool),
         std::move(logger)};
 }
 
